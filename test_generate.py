@@ -163,9 +163,12 @@ if __name__ == "__main__":
 
     model = LlamaForCausalLM.from_pretrained("lmsys/vicuna-7b-v1.3",torch_dtype=torch.float16,low_cpu_mem_usage=True, use_cache=False).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained("lmsys/vicuna-7b-v1.3",use_fast= False)
+    indices = [i for i, token in enumerate(tokenizer.get_vocab().keys()) if '\r' in token]
+    print(indices)
     model.stega_type = "arithmetic"
     model.bit_stream = "011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101"
-    model.num_bit = 26 
+    len(model.bit_stream)
+    model.num_bit = 2
     model.requires_grad_(False)
     model.no_eos = True
     
@@ -194,8 +197,8 @@ if __name__ == "__main__":
                                 attention_mask=attn_masks,
                                 generation_config=gen_config, 
                                 pad_token_id=tokenizer.pad_token_id)[0]
-    print(tokenizer.decode(torch.tensor(input_ids[0])))
-    print(tokenizer.decode( torch.tensor(output_ids[suffix_manager._assistant_role_slice.stop:])))
+    print(tokenizer.decode(torch.tensor(output_ids[suffix_manager._assistant_role_slice.stop:])))
+    print(output_ids[suffix_manager._assistant_role_slice.stop:])
     bit_string = model.decode_stega(input_ids, 
                                    output_ids[suffix_manager._assistant_role_slice.stop:],
                                 attention_mask=attn_masks,

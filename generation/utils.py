@@ -19,7 +19,7 @@ import inspect
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
-from .encoding_utils import HuffmanCoding,bits2int,int2bits,num_same_from_beg
+from .encoding_utils import HuffmanCoding,bits2int,int2bits,num_same_from_beg,is_sent_finish
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -83,6 +83,7 @@ logger = logging.get_logger(__name__)
 if is_accelerate_available():
     from accelerate.hooks import AlignDevicesHook, add_hook_to_module
 
+return_tokens = [2104, 3238, 3336, 4970, 6075, 6756, 8117, 8443, 10175, 11167, 14078, 14626, 15231, 16737, 17822, 18584, 19451, 22993, 23592, 24426, 25982, 26471, 29722, 30004]
 
 @dataclass
 class GreedySearchDecoderOnlyOutput(ModelOutput):
@@ -2721,6 +2722,8 @@ class GenerationMixin:
             if self.stega_type == "binary":
                 if self.no_eos:
                     next_tokens_scores[:,eos_token_id] = -999999999
+                    next_tokens_scores[:,13] = -999999999
+                    next_tokens_scores[:,return_tokens] = -999999999
                 next_tokens = torch.argsort(next_tokens_scores, dim=1,descending=True)[:,:(2**self.num_bit)]
                 index = ((next_tokens[0] == output_ids[token_idx]).nonzero(as_tuple=True)[0])
                 bit_stream+=format(index.item(), 'b').zfill(self.num_bit)
@@ -2733,6 +2736,9 @@ class GenerationMixin:
                 probs = torch.exp(log_probs)
                 if self.no_eos:
                     probs[:,eos_token_id] = -999999999
+                    probs[:,13] = -999999999
+                    probs[:,return_tokens] = -999999999
+                    
                 probs_array,next_tokens = torch.sort(probs, dim=1,descending=True)
                 probs_array = probs_array[:,:(2**self.num_bit)]
                 next_tokens = next_tokens[:,:(2**self.num_bit)]
@@ -2749,17 +2755,20 @@ class GenerationMixin:
                 next_tokens = torch.tensor([output_ids[token_idx]]).to(self.model.device)
                 token_idx+=1
             elif self.stega_type == "arithmetic":
+                if token_idx>=(len(output_ids)):
+                    break
                 next_tokens_scores = next_tokens_scores.double()
                 log_probs = torch.nn.functional.log_softmax(next_tokens_scores, dim=1)
-                
-                probs = torch.exp(log_probs)/0.9
+                probs = torch.exp(log_probs)/self.temp
                 if self.no_eos:
                     probs[:,eos_token_id] = -999999999
+                    probs[:,13] = -999999999
+                    probs[:,return_tokens] = -999999999
                 probs_array,next_tokens = torch.sort(probs, dim=1,descending=True)
                 probs_array = probs_array[0]
                 cur_int_range = cur_interval[1]-cur_interval[0]
                 cur_threshold = 1/cur_int_range
-                k = min(max(2, (probs_array < cur_threshold).nonzero()[0].item()), 5000)
+                k = min(max(2, (probs_array < cur_threshold).nonzero()[0].item()), 300)
                 probs_temp_int = probs_array[:k] # Cutoff all but top k
                 
                  # Round probabilities to integers given precision
@@ -2778,7 +2787,6 @@ class GenerationMixin:
                 rank = (next_tokens == output_ids[token_idx]).nonzero()[0][1].item()
 
                 # Handle most errors that could happen because of BPE with heuristic
-
                 selection = rank
                 
                 # Calculate new range as ints
@@ -3053,7 +3061,6 @@ class GenerationMixin:
             # argmax
             if self.stega_type is None:
                 next_tokens = torch.argmax(next_tokens_scores, dim=-1)
-                print(next_tokens)
             elif self.stega_type == "binary":
                 
                 if chunk>=len(self.bit_stream)//self.num_bit:
@@ -3061,12 +3068,15 @@ class GenerationMixin:
                 else:
                     if self.no_eos:
                         next_tokens_scores[:,eos_token_id] = -999999999
+                        next_tokens_scores[:,13] = -999999999
+                        next_tokens_scores[:,return_tokens] = -999999999
                     next_tokens = torch.argsort(next_tokens_scores, dim=1,descending=True)[:,:(2**self.num_bit)]
                     bit_chunk = self.bit_stream[self.num_bit*chunk:(chunk+1)*self.num_bit]
                     next_tokens = next_tokens[:,int(bit_chunk, 2)]
                     chunk+=1
             elif self.stega_type == "huffman":    
                 if chunk>=len(self.bit_stream):
+                    next_tokens = torch.argmax(next_tokens_scores, dim=-1)
                     break
                 else:
                     
@@ -3074,6 +3084,8 @@ class GenerationMixin:
                     probs = torch.exp(log_probs)
                     if self.no_eos:
                         probs[:,eos_token_id] = -999999999
+                        probs[:,13] = -999999999
+                        probs[:,return_tokens] = -999999999
                     probs_array,next_tokens = torch.sort(probs, dim=1,descending=True)
                     probs_array = probs_array[:,:(2**self.num_bit)]
                     next_tokens = next_tokens[:,:(2**self.num_bit)]
@@ -3098,16 +3110,17 @@ class GenerationMixin:
                     
                     next_tokens_scores = next_tokens_scores.double()
                     log_probs = torch.nn.functional.log_softmax(next_tokens_scores, dim=1)
-                    
-                    probs = torch.exp(log_probs)/0.9
+                    probs = torch.exp(log_probs)/self.temp
                     if self.no_eos:
                         probs[:,eos_token_id] = -999999999
+                        probs[:,13] = -999999999
+                        probs[:,return_tokens] = -999999999
                     probs_array,next_tokens = torch.sort(probs, dim=1,descending=True)
                     probs_array = probs_array[0]
                     cur_int_range = cur_interval[1]-cur_interval[0]
                     cur_threshold = 1/cur_int_range
 
-                    k = min(max(2, (probs_array < cur_threshold).nonzero()[0].item()), 5000)
+                    k = min(max(2, (probs_array < cur_threshold).nonzero()[0].item()), 300)
                     probs_temp_int = probs_array[:k] # Cutoff all but top k
                     
                      # Round probabilities to integers given precision
@@ -3144,7 +3157,6 @@ class GenerationMixin:
                     # Consume most significant bits which are now fixed and update interval
                     num_bits_encoded = num_same_from_beg(new_int_bottom_bits_inc, new_int_top_bits_inc)
                     chunk += num_bits_encoded
-                    print(chunk)
                     new_int_bottom_bits = new_int_bottom_bits_inc[num_bits_encoded:] + [0]*num_bits_encoded
                     new_int_top_bits = new_int_top_bits_inc[num_bits_encoded:] + [1]*num_bits_encoded
 

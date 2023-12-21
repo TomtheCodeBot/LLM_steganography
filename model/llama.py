@@ -968,7 +968,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         self.bit_stream = ""
         self.no_eos = False
         self.post_init()
-        self.temp=1
+        self.temp=0.7
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
