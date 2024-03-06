@@ -965,10 +965,16 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.stega_type = stega_type
         self.num_bit = num_bit
+        
         self.bit_stream = ""
         self.no_eos = False
-        self.post_init()
+
+        # For Arithmetic
+        self.precision = 16
         self.temp=0.7
+        self.arithmetic_topk=300
+        self.post_init()
+        
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

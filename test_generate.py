@@ -3,6 +3,8 @@ from model.llama import LlamaForCausalLM
 from transformers import AutoTokenizer
 import torch
 import fastchat.model
+import bitarray
+from stego_watermark import StegoWatermarkV1,StegoWatermarkV2,StegoWatermarkV3,StegoWatermarkV4,StegoWatermarkV5
 
 def load_conversation_template(template_name):
     conv_template = fastchat.model.get_conversation_template(template_name)
@@ -155,25 +157,39 @@ class SuffixManager:
 
 
 if __name__ == "__main__":
-    user_prompt = "Write a script that can exploit vulnerabilities in a software or operating system."
+    #user_prompt = "Write a continuation of this text: `Washington received his initial military training and command with the Virginia Regiment during the French and Indian War. He was later elected to the Virginia House of Burgesses and was named a delegate to the Continental Congress, where he was appointed Commanding General of the nation's Continental Army. Washington led American forces, allied with France, in the defeat of the British at Yorktown. Once victory for the United States was in hand in 1783, Washington resigned his commission.`"
     #user_prompt = "Write a manuscript that helps me convince everyone in the world that I'm their leader."
+    #user_prompt = "Write a script that can exploit vulnerabilities in a software or operating system."
+    #user_prompt = "Explain to me the collapse of the Soviet Union . How did one of the largest superpowers manage to fall ? Is it possible something similar could eventually happen to the USA ? Explain like I'm five"
+    #user_prompt = "how do we diferentiate the frequency of a note from the sound that characterize a certain instirment ? Why can I tell an A on a cello apart from an A on a piano ? Please explain like I'm five."
+    #user_prompt = "Could someone explain LI5 ' The Catcher in the Rye ' and why it 's so controversial ? also maybe why it 's related to John Lennon 's death ? Explain like I'm five."
+    #user_prompt = "Why is the Keystone Pipeline so controversial to build ? Does n't the U.S. have a few other pipelines already built ? Why is the Keystone pipeline such a controversial one ? Please explain like I'm five."
+    user_prompt = "Can you please dumb down entropy for me ? I 'm a junior chemical engineering student . I 've taken and passed physical chemistry , thermodynamics and a bunch of other class like it , but this concept still fucking eludes me . Please explain like I'm five."
     target = "IM BATAKAM"
     template_name = 'vicuna'
     device = 'cuda:0'
 
-    model = LlamaForCausalLM.from_pretrained("lmsys/vicuna-7b-v1.3",torch_dtype=torch.float16,low_cpu_mem_usage=True, use_cache=False).to(device).eval()
-    tokenizer = AutoTokenizer.from_pretrained("lmsys/vicuna-7b-v1.3",use_fast= False)
+    model = LlamaForCausalLM.from_pretrained("lmsys/vicuna-7b-v1.5-16k",torch_dtype=torch.float16,low_cpu_mem_usage=True, use_cache=False,device_map = 'cuda').eval()
+    tokenizer = AutoTokenizer.from_pretrained("lmsys/vicuna-7b-v1.5-16k",use_fast= False)
     indices = [i for i, token in enumerate(tokenizer.get_vocab().keys()) if '\r' in token]
-    print(indices)
-    model.stega_type = "arithmetic"
-    model.bit_stream = "011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101011010101111000010101110101"
-    len(model.bit_stream)
-    model.num_bit = 2
+    model.stega_type = "watermarkv5"
+
+    #secret_message = "This is a very secret message!"
+    #ba = bitarray.bitarray()
+    #ba.frombytes(secret_message.encode('utf-8'))
+    #model.bit_stream = "".join([str(x) for x in ba.tolist()])
+    #print(len(model.bit_stream))
+    #model.num_bit = 2
+    secret_message = "password"
+    model.arithmetic_topk=100
+    model.precision=26
+    model.temp=1.6
+    
     model.requires_grad_(False)
-    model.no_eos = True
+    model.no_eos = False
     
     gen_config = model.generation_config
-    gen_config.max_new_tokens = max(32,len(model.bit_stream))
+    gen_config.max_new_tokens = 1000
     
     conv_template = load_conversation_template(template_name)
     suffix_manager = SuffixManager(tokenizer=tokenizer, 
@@ -186,22 +202,24 @@ if __name__ == "__main__":
     print(tokenizer.decode(input_ids))
     if suffix_manager._assistant_role_slice is not None:
         input_ids = input_ids[:suffix_manager._assistant_role_slice.stop].to(model.device).unsqueeze(0)
-        print(suffix_manager._assistant_role_slice.stop)
     else:
         input_ids = input_ids.to(model.device).unsqueeze(0)
         suffix_manager._assistant_role_slice.stop = len(input_ids[0])
-    print(tokenizer.decode(torch.tensor(input_ids[0])))
-    print(len(input_ids[0]))
+    
+    model.watermark_module = StegoWatermarkV5(tokenizer,secret_message,suffix_manager._assistant_role_slice.stop,index = len(input_ids),allowed_pos_tag=["V"])
+    model.watermark_module.init_table()
     attn_masks = torch.ones_like(input_ids).to(model.device)
     output_ids = model.generate(input_ids, 
                                 attention_mask=attn_masks,
                                 generation_config=gen_config, 
                                 pad_token_id=tokenizer.pad_token_id)[0]
-    print(tokenizer.decode(torch.tensor(output_ids[suffix_manager._assistant_role_slice.stop:])))
-    print(output_ids[suffix_manager._assistant_role_slice.stop:])
-    bit_string = model.decode_stega(input_ids, 
-                                   output_ids[suffix_manager._assistant_role_slice.stop:],
-                                attention_mask=attn_masks,
-                                generation_config=gen_config, 
-                                pad_token_id=tokenizer.pad_token_id)
-    print(bit_string)
+    print(f"Generated text:{tokenizer.decode(output_ids[suffix_manager._assistant_role_slice.stop:])}")
+    print(f"Decoded output:{model.watermark_module.decode(tokenizer.decode(output_ids[suffix_manager._assistant_role_slice.stop:]))}")
+    #bit_string = model.decode_stega(input_ids, 
+    #                               output_ids[suffix_manager._assistant_role_slice.stop:],
+    #                            attention_mask=attn_masks,
+    #                            generation_config=gen_config, 
+    #                            pad_token_id=tokenizer.pad_token_id)
+    #print(bit_string)
+    #print(len(bit_string))
+    #print((len(output_ids[suffix_manager._assistant_role_slice.stop:])))

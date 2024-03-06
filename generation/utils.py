@@ -13,13 +13,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import math
 import copy
 import inspect
 import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
-from .encoding_utils import HuffmanCoding,bits2int,int2bits,num_same_from_beg,is_sent_finish
+from .encoding_utils import HuffmanCoding,limit_past, kl, entropy, bits2int, int2bits, is_sent_finish, num_same_from_beg
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -2666,8 +2666,8 @@ class GenerationMixin:
         this_peer_finished = False  # used by synced_gpus only
         token_idx= 0
         bit_stream = ""
-        max_val = 2**self.num_bit #For arithmetic
-        threshold = 2**(-self.num_bit) #For arithmetic
+        max_val = 2**self.precision #For arithmetic
+        threshold = 2**(-self.precision) #For arithmetic
         cur_interval = [0, max_val] # bottom inclusive, top exclusive
         while True:
             if synced_gpus:
@@ -2732,8 +2732,7 @@ class GenerationMixin:
             elif self.stega_type == "huffman":                
                 if token_idx>=(len(output_ids)):
                     break
-                log_probs = torch.nn.functional.log_softmax(next_tokens_scores, dim=-1)
-                probs = torch.exp(log_probs)
+                probs = torch.nn.functional.softmax(next_tokens_scores, dim=-1)
                 if self.no_eos:
                     probs[:,eos_token_id] = -999999999
                     probs[:,13] = -999999999
@@ -2757,18 +2756,20 @@ class GenerationMixin:
             elif self.stega_type == "arithmetic":
                 if token_idx>=(len(output_ids)):
                     break
-                next_tokens_scores = next_tokens_scores.double()
-                log_probs = torch.nn.functional.log_softmax(next_tokens_scores, dim=1)
-                probs = torch.exp(log_probs)/self.temp
                 if self.no_eos:
-                    probs[:,eos_token_id] = -999999999
-                    probs[:,13] = -999999999
-                    probs[:,return_tokens] = -999999999
+                        next_tokens_scores[:,eos_token_id] = -1e20
+                        next_tokens_scores[:,13] = -1e20
+                        next_tokens_scores[:,return_tokens] = -1e20
+
+                next_tokens_scores = next_tokens_scores.double()/self.temp
+                log_probs = torch.nn.functional.log_softmax(next_tokens_scores, dim=1)
+                probs = torch.nn.functional.softmax(next_tokens_scores, dim=1)
+
                 probs_array,next_tokens = torch.sort(probs, dim=1,descending=True)
                 probs_array = probs_array[0]
                 cur_int_range = cur_interval[1]-cur_interval[0]
                 cur_threshold = 1/cur_int_range
-                k = min(max(2, (probs_array < cur_threshold).nonzero()[0].item()), 300)
+                k = min(max(2, (probs_array < cur_threshold).nonzero()[0].item()), self.arithmetic_topk)
                 probs_temp_int = probs_array[:k] # Cutoff all but top k
                 
                  # Round probabilities to integers given precision
@@ -2794,8 +2795,8 @@ class GenerationMixin:
                 new_int_top = cum_probs[selection]
 
                 # Convert range to bits
-                new_int_bottom_bits_inc = list(reversed(int2bits(new_int_bottom, self.num_bit)))
-                new_int_top_bits_inc = list(reversed(int2bits(new_int_top-1, self.num_bit))) # -1 here because upper bound is exclusive
+                new_int_bottom_bits_inc = list(reversed(int2bits(new_int_bottom, self.precision)))
+                new_int_top_bits_inc = list(reversed(int2bits(new_int_top-1, self.precision))) # -1 here because upper bound is exclusive
                 # Emit most significant bits which are now fixed and update interval
                 num_bits_encoded = num_same_from_beg(new_int_bottom_bits_inc, new_int_top_bits_inc)
                 if token_idx == len(output_ids)-1:
@@ -3005,11 +3006,16 @@ class GenerationMixin:
 
         this_peer_finished = False  # used by synced_gpus only
         chunk = 0
-        max_val = 2**self.num_bit #For arithmetic
-        threshold = 2**(-self.num_bit) #For arithmetic
+        max_val = 2**self.precision #For arithmetic
+        threshold = 2**(-self.precision) #For arithmetic
         cur_interval = [0, max_val] # bottom inclusive, top exclusive
 
-                    
+        #Arithmetic statistics
+        total_num = 0
+        total_num_for_stats = 0
+        total_log_probs = 0
+        total_kl = 0 # in bits
+        total_entropy_ptau = 0
         while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
@@ -3076,12 +3082,11 @@ class GenerationMixin:
                     chunk+=1
             elif self.stega_type == "huffman":    
                 if chunk>=len(self.bit_stream):
-                    next_tokens = torch.argmax(next_tokens_scores, dim=-1)
+                    #next_tokens = torch.argmax(next_tokens_scores, dim=-1)
                     break
                 else:
                     
-                    log_probs = torch.nn.functional.log_softmax(next_tokens_scores, dim=-1)
-                    probs = torch.exp(log_probs)
+                    probs = torch.nn.functional.softmax(next_tokens_scores, dim=-1)
                     if self.no_eos:
                         probs[:,eos_token_id] = -999999999
                         probs[:,13] = -999999999
@@ -3107,28 +3112,33 @@ class GenerationMixin:
                 if chunk>=len(self.bit_stream):
                     break
                 else:
-                    
-                    next_tokens_scores = next_tokens_scores.double()
-                    log_probs = torch.nn.functional.log_softmax(next_tokens_scores, dim=1)
-                    probs = torch.exp(log_probs)/self.temp
                     if self.no_eos:
-                        probs[:,eos_token_id] = -999999999
-                        probs[:,13] = -999999999
-                        probs[:,return_tokens] = -999999999
-                    probs_array,next_tokens = torch.sort(probs, dim=1,descending=True)
-                    probs_array = probs_array[0]
+                        next_tokens_scores[:,eos_token_id] = -1e20
+                        next_tokens_scores[:,13] = -1e20
+                        next_tokens_scores[:,return_tokens] = -1e20
+
+                    next_tokens_scores, next_tokens = torch.sort(next_tokens_scores, dim=1,descending=True)
+
+                    next_tokens_scores = next_tokens_scores.double()
+                    next_tokens_scores_temp = next_tokens_scores/self.temp
+                    log_probs_temp = torch.nn.functional.log_softmax(next_tokens_scores_temp, dim=1).squeeze()
+                    probs_array = torch.nn.functional.softmax(next_tokens_scores_temp, dim=1)
+
+                    log_probs = torch.nn.functional.log_softmax(next_tokens_scores, dim=1).squeeze()
+
+                    probs_array = probs_array.squeeze()
                     cur_int_range = cur_interval[1]-cur_interval[0]
                     cur_threshold = 1/cur_int_range
 
-                    k = min(max(2, (probs_array < cur_threshold).nonzero()[0].item()), 300)
+                    k = min(max(2, (probs_array < cur_threshold).nonzero()[0].item()), self.arithmetic_topk)
                     probs_temp_int = probs_array[:k] # Cutoff all but top k
                     
-                     # Round probabilities to integers given precision
-                    probs_temp_int = probs_temp_int/probs_temp_int.sum()*cur_int_range
+                    # Rescale to correct range
+                    probs_temp_int = (probs_temp_int/probs_temp_int.sum())*cur_int_range
+
+                    # Round probabilities to integers given precision
                     probs_temp_int = probs_temp_int.round().long()
                     cum_probs = probs_temp_int.cumsum(0)
-
-                    
                     # Remove any elements from the bottom if rounding caused the total prob to be too large
                     overfill_index = (cum_probs > cur_int_range).nonzero()
                     if len(overfill_index) > 0:
@@ -3136,14 +3146,16 @@ class GenerationMixin:
 
                     # Add any mass to the top if removing/rounding causes the total prob to be too small
                     cum_probs += cur_int_range-cum_probs[-1] # add
-
                     # Get out resulting probabilities
-
-
+                    probs_final = cum_probs.clone()
+                    probs_final[1:] = cum_probs[1:] - cum_probs[:-1]
+                    # Convert to position in range
                     cum_probs += cur_interval[0]
-                    message_bits = self.bit_stream[chunk:chunk+self.num_bit]
-                    if chunk+self.num_bit > len(self.bit_stream):
-                        message_bits = message_bits + "0"*(chunk+self.num_bit-len(self.bit_stream))
+
+
+                    message_bits = self.bit_stream[chunk:chunk+self.precision]
+                    if chunk+self.precision > len(self.bit_stream):
+                        message_bits = message_bits + "0"*(chunk+self.precision-len(self.bit_stream))
                     message_idx = bits2int(reversed(message_bits))
                     selection = (cum_probs > message_idx).nonzero()[0].item()
                     # Calculate new range as ints
@@ -3151,8 +3163,8 @@ class GenerationMixin:
                     new_int_top = cum_probs[selection]
 
                     # Convert range to bits
-                    new_int_bottom_bits_inc = list(reversed(int2bits(new_int_bottom, self.num_bit)))
-                    new_int_top_bits_inc = list(reversed(int2bits(new_int_top-1, self.num_bit))) # -1 here because upper bound is exclusive
+                    new_int_bottom_bits_inc = list(reversed(int2bits(new_int_bottom, self.precision)))
+                    new_int_top_bits_inc = list(reversed(int2bits(new_int_top-1, self.precision))) # -1 here because upper bound is exclusive
 
                     # Consume most significant bits which are now fixed and update interval
                     num_bits_encoded = num_same_from_beg(new_int_bottom_bits_inc, new_int_top_bits_inc)
@@ -3164,7 +3176,24 @@ class GenerationMixin:
                     cur_interval[1] = bits2int(reversed(new_int_top_bits))+1 # +1 here because upper bound is exclusive
 
                     next_tokens = next_tokens[:,int(selection)]
-                pass
+                    # Gather statistics
+                    total_log_probs += log_probs[selection].item()
+
+                    q = probs_final.double()/probs_final.sum()
+                    logq = q.log()
+                    total_kl += kl(q, logq, log_probs[:len(q)])
+                    total_entropy_ptau += entropy(probs_array, log_probs_temp)
+                    total_num_for_stats += 1
+            elif "watermark" in self.stega_type:
+                if self.no_eos:
+                    #next_tokens_scores[:,eos_token_id] = -1e20
+                    next_tokens_scores[:,13] = -1e20
+                    next_tokens_scores[:,return_tokens] = -1e20
+                if self.stega_type == "watermarkv3":
+                    next_tokens_scores,input_ids  = self.watermark_module.augment_next_token(next_tokens_scores,input_ids)
+                else:
+                    next_tokens_scores  = self.watermark_module.augment_next_token(next_tokens_scores,input_ids)
+                next_tokens = torch.argmax(next_tokens_scores, dim=-1)
             else:
                 raise Exception("No such steganography exist")
             # finished sentences should have their next token be a padding token
@@ -3197,7 +3226,15 @@ class GenerationMixin:
 
             if this_peer_finished and not synced_gpus:
                 break
-
+        if self.stega_type == "arithmetic":
+            avg_NLL = -total_log_probs/total_num_for_stats
+            avg_KL = total_kl/total_num_for_stats
+            avg_Hq = total_entropy_ptau/total_num_for_stats
+            bit_per_word = chunk/total_num_for_stats
+            print(f"Perplexity:{math.exp(avg_NLL)}")
+            print(f"KL Divergence: {avg_KL}")
+            print(f"Entropy: {avg_Hq}")
+            print(f"Number of bit per tokens: {bit_per_word}")
         if streamer is not None:
             streamer.end()
 
